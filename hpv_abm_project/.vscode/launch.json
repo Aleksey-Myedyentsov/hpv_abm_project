@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run scenarios",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/simulate.py",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Plot results",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/plot.py",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
