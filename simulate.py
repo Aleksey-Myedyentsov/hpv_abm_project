@@ -1,120 +1,83 @@
 from hpv_abm.model import HPVNetworkModel
-import pandas as pd
+import csv
+from statistics import mean
 import random
 
-# Scenarios: coverage for females/males (shares 0..1)
+YEARS_WARMUP = 10
+YEARS_MAIN = 100
+RUNS_PER_SCENARIO = 10
+
 SCENARIOS = {
-    "S0_no_intervention": dict(cov_f=0.0, cov_m=0.0),
-    "S1_girls_only_80":   dict(cov_f=0.8, cov_m=0.0),
-    "S2_both_60":         dict(cov_f=0.6, cov_m=0.6),
-    "S3_both_80":         dict(cov_f=0.8, cov_m=0.8),
+    "S0_no_intervention": dict(coverage_f=0.0,  coverage_m=0.0),
+    "S1_girls_only_80":   dict(coverage_f=0.80, coverage_m=0.0),
+    "S2_both_60":         dict(coverage_f=0.60, coverage_m=0.60),
+    "S3_both_80":         dict(coverage_f=0.80, coverage_m=0.80),
 }
 
-YEARS_TOTAL = 50
-BURN_IN = 12          # years with no vaccination
-RUNS = 30
-N = 10_000
-SEED0 = 42
+def run_one(scen_name: str, coverage_f: float, coverage_m: float, seed: int):
+    # Model receive vaccine_age/coverage_f/coverage_m
+    m = HPVNetworkModel(
+        seed=seed,
+        vaccine_age=12,
+        coverage_f=coverage_f,
+        coverage_m=coverage_m,
+        contacts_per_year=20,
+        p_transmission_hr=0.35,
+        p_transmission_lr=0.25,
+        p_cancer=0.005,
+        cancer_risk_mult_if_vaccinated=0.2,
+        catchup_years=12,
+        catchup_age_min=12,
+        catchup_age_max=26,
+    )
 
-# One-time catch-up window right after burn-in
-CATCHUP_ENABLE = True
-VACCINE_AGE = 12
-CATCHUP_MAX_AGE = 15  # vaccinate [12..15] once when intervention starts
+    # warming up without vaccination
+    for _ in range(YEARS_WARMUP):
+        m.step(vacc_enabled=False)
 
+    # we turn on the intervention
+    rows = []
+    met0 = m.metrics(); met0["t"] = 0; rows.append(met0)
 
-def _run_years(model: HPVNetworkModel, years: int) -> pd.DataFrame:
-    """Run model for N years and return ONLY the rows added during this call."""
-    if years <= 0:
-        df0 = model.datacollector.get_model_vars_dataframe().copy()
-        return df0.iloc[0:0, :]
-    if hasattr(model, "run") and callable(getattr(model, "run")):
-        before = len(model.datacollector.get_model_vars_dataframe())
-        model.run(years=years)
-        after_df = model.datacollector.get_model_vars_dataframe()
-        return after_df.iloc[before:, :].reset_index(drop=True)
-    # fallback
-    for _ in range(years):
-        model.step()
-    df = model.datacollector.get_model_vars_dataframe().copy()
-    return df.iloc[-years:, :].reset_index(drop=True)
+    m.step(vacc_enabled=(coverage_f > 0 or coverage_m > 0))
+    met1 = m.metrics(); met1["t"] = 1; rows.append(met1)
+    print(f"[DEBUG] {scen_name}: year1 vaccinated={int(met1['V'])} ({met1['V']/met1['N']*100:.2f}%), "
+          f"prev={met1['Prev']*100:.2f}%")
 
+    for t in range(2, YEARS_MAIN + 1):
+        m.step(vacc_enabled=(coverage_f > 0 or coverage_m > 0))
+        met = m.metrics(); met["t"] = t; rows.append(met)
 
-def _apply_catchup(model: HPVNetworkModel):
-    """One-time catch-up right after burn-in."""
-    if not CATCHUP_ENABLE:
-        return
-    cov_f = getattr(model, "cov_f", 0.0)
-    cov_m = getattr(model, "cov_m", 0.0)
-    if cov_f <= 0.0 and cov_m <= 0.0:
-        return
+    return rows
 
-    changed = 0
-    for a in model.agents:
-        if a.vaccinated:
-            continue
-        if VACCINE_AGE <= a.age <= CATCHUP_MAX_AGE:
-            p = cov_f if a.sex == "F" else cov_m
-            if random.random() < p:
-                a.vaccinated = True
-                changed += 1
-    # можно залогировать при отладке:
-    # print(f"[catchup] vaccinated {changed}")
+def aggregate_mean(runs):
+    keys = ["N","I_HR","I_LR","R","V","Prev","CancerCum"]
+    T = len(runs[0])
+    avg = []
+    for i in range(T):
+        avg.append({"t": i, **{k: mean(run[i][k] for run in runs) for k in keys}})
+    return avg
 
+def main():
+    all_rows = []
+    for scen, cov in SCENARIOS.items():
+        print(f"[RUN] {scen} ...")
+        runs = []
+        for r in range(RUNS_PER_SCENARIO):
+            seed = random.randint(1, 10**9)
+            runs.append(run_one(scen, cov["coverage_f"], cov["coverage_m"], seed))
+        mean_rows = aggregate_mean(runs)
+        for row in mean_rows:
+            row["scenario"] = scen
+            all_rows.append(row)
+        with open(f"out_{scen}_mean.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=mean_rows[0].keys())
+            w.writeheader(); w.writerows(mean_rows)
 
-def run_scenario(name: str, params: dict,
-                 N: int = N, years_total: int = YEARS_TOTAL,
-                 burn_in: int = BURN_IN, runs: int = RUNS, seed: int = SEED0) -> pd.DataFrame:
-    all_frames = []
-
-    for r in range(runs):
-        # 1) burn-in без вакцинации
-        model = HPVNetworkModel(
-            N=N,
-            vacc_age=VACCINE_AGE,
-            cov_f=0.0,
-            cov_m=0.0,
-            seed=seed + r,
-        )
-        burn_df = _run_years(model, burn_in)
-
-        # 2) включаем сценарные coverage
-        model.cov_f = params["cov_f"]
-        model.cov_m = params["cov_m"]
-
-        # 3) единоразовый catch-up (12..15)
-        _apply_catchup(model)
-
-        # 4) остаток лет
-        remain = max(0, years_total - burn_in)
-        inter_df = _run_years(model, remain)
-
-        df = pd.concat([burn_df, inter_df], ignore_index=True)
-        df["run"] = r
-        df["scenario"] = name
-        all_frames.append(df)
-
-    full = pd.concat(all_frames, ignore_index=True)
-
-    # mean по ранам
-    group_cols = ["scenario", "t"]
-    keep_cols = ["N", "I_HR", "I_LR", "R", "V", "Prev", "CancerCum"]
-    existing = [c for c in keep_cols if c in full.columns]
-    agg = full.groupby(group_cols, as_index=False)[existing].mean()
-
-    full.to_csv(f"out_{name}_raw.csv", index=False)
-    agg.to_csv(f"out_{name}_mean.csv", index=False)
-    return agg
-
-
-def run_all():
-    results = []
-    for name, params in SCENARIOS.items():
-        print(f"[RUN] {name} ...")
-        results.append(run_scenario(name, params))
-    all_agg = pd.concat(results, ignore_index=True)
-    all_agg.to_csv("out_all_scenarios_mean.csv", index=False)
+    with open("out_all_scenarios_mean.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["scenario","t","N","I_HR","I_LR","R","V","Prev","CancerCum"])
+        w.writeheader(); w.writerows(all_rows)
     print("Done. Saved out_all_scenarios_mean.csv and per-scenario CSVs.")
 
-
 if __name__ == "__main__":
-    run_all()
+    main()
