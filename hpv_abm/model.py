@@ -1,291 +1,237 @@
-# hpv_abm/model.py
-from __future__ import annotations
 import random
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
-import numpy as np
+from typing import List, Dict
 import networkx as nx
 
-from mesa import Model, Agent
-from mesa.time import RandomActivation
-from mesa.datacollection import DataCollector
+STATE_S = "S"
+STATE_I_HR = "I_HR"
+STATE_I_LR = "I_LR"
+STATE_R = "R"
 
 
-# -----------------------------
-# Agent
-# -----------------------------
-class HPVAgent(Agent):
-    """
-    Agent with:
-      - sex: 'M'/'F'
-      - age: int (years)
-      - state: 'S', 'I_LR', 'I_HR', 'R'
-      - vaccinated: bool
-      - infection_years: years elapsed in current infection (for display; recovery is stochastic)
-      - cancer_flag: whether developed cancer (cumulative)
-      - activity: 'low'/'mid'/'high' (derived from degree quantiles)
-    """
-    def __init__(self, unique_id: int, model: "HPVNetworkModel", sex: str, age: int):
-        super().__init__(unique_id, model)
-        self.sex = sex
-        self.age = age
-        self.state = 'S'
-        self.vaccinated = False
-        self.infection_years = 0
-        self.cancer_flag = False
-        self.activity = 'low'
+# --- minimal data collector for simulate.py compatibility ---
+class _MiniDataCollector:
+    def __init__(self, model):
+        self.model = model
+        self._rows = []
+    def collect(self):
+        self._rows.append(self.model.metrics())
+    def get_model_vars_dataframe(self):
+        import pandas as pd
+        return pd.DataFrame(self._rows)
+@dataclass
+class Agent:
+    idx: int
+    sex: str
+    age: int
+    state: str
+    vaccinated: bool = False
+    inf_timer: int = 0
 
-    # --- helpers ---
-    def infectious(self) -> bool:
-        return self.state in ('I_LR', 'I_HR')
-
-    def susceptibility_multiplier(self) -> float:
-        # vaccine efficacy reduces susceptibility (but does not alter infectiousness here)
-        if self.vaccinated:
-            return max(0.0, 1.0 - self.model.vaccine_efficacy)
-        return 1.0
-
-    # --- per-step logic ---
-    def step(self):
-        # Ageing (annual step)
-        self.age += 1
-
-        # Vaccination at 12
-        if self.age == 12 and not self.vaccinated:
-            cov = self.model.coverage_f if self.sex == 'F' else self.model.coverage_m
-            if self.random.random() < cov:
-                self.vaccinated = True
-
-        # Infection course: recover with prob gamma; R (immune) wanes after R_duration_years
-        if self.infectious():
-            self.infection_years += 1
-            if self.random.random() < self.model.gamma_recovery:
-                self.state = 'R'
-                self.infection_years = 0
-        elif self.state == 'R':
-            # time in R is tracked implicitly by "age since R"? we approximate by fixed duration
-            # Use agent-level memory via infection_years as "years since entering R"
-            self.infection_years += 1
-            if self.infection_years >= self.model.R_duration_years:
-                self.state = 'S'
-                self.infection_years = 0
-
-        # Cancer progression: F, age >= 25, in I_HR
-        if self.sex == 'F' and self.age >= 25 and self.state == 'I_HR' and not self.cancer_flag:
-            if self.random.random() < self.model.p_cancer_per_year_HR:
-                self.cancer_flag = True
-
-
-# -----------------------------
-# Model
-# -----------------------------
-class HPVNetworkModel(Model):
-    """
-    Agent-based HPV model on an assortative power-law-like contact network.
-    Key params:
-      N: population size
-      T: total years to simulate
-      vaccine_efficacy (epsilon)
-      coverage_f, coverage_m (tau_f, tau_m)
-      beta_f, beta_m: per-contact transmission probabilities (recipient sex specific)
-      hr_fraction: prob(new infection is HR type)
-      gamma_recovery: annual recovery prob
-      R_duration_years: immunity waning
-      p_cancer_per_year_HR: annual cancer prob for F>=25 in I_HR
-      burn_in_years: years with no vaccination (Scenario 0 warm-up)
-    """
+class HPVModel:
     def __init__(
         self,
-        N: int = 10000,
-        vaccine_efficacy: float = 0.90,
-        coverage_f: float = 0.0,
-        coverage_m: float = 0.0,
-        beta_f: float = 0.08,     # prob for female recipient
-        beta_m: float = 0.08,     # prob for male recipient
-        hr_fraction: float = 0.6, # share of HR among new infections
-        gamma_recovery: float = 0.25,
-        R_duration_years: int = 2,
-        p_cancer_per_year_HR: float = 0.001,
-        initial_prev: float = 0.01,   # 1% infected at init (HR)
-        powerlaw_gamma: float = 2.5,
-        mean_degree: float = 3.0,
-        assort_within_activity: float = 0.85,   # rewiring preference
-        burn_in_years: int = 12,  # run w/o vaccination to reach a baseline
-        seed: Optional[int] = 42
+        N: int = 10_000,
+        seed: int = 42,
+        gamma: float = 2.5,
+        assortativity: float = 0.15,
+        p_transmission_hr: float = 0.35,
+        p_transmission_lr: float = 0.25,
+        hr_share: float = 0.6,
+        mean_duration: float = 2.0,
+        p_waning: float = 0.05,
+        p_cancer: float = 0.005,
+        cancer_risk_mult_if_vaccinated: float = 0.2,
+        vaccine_eff: float = 0.9,
+        vacc_age: int = 12,
+        cov_f: float = 0.0,
+        cov_m: float = 0.0,
+        contacts_per_year: int = 20,
+        max_age: int = 80,
+        annual_birth_fraction: float = 0.04,
+        catchup_years: int = 12,
+        catchup_age_min: int = 12,
+        catchup_age_max: int = 26,
+        **kwargs,
     ):
-        super().__init__(seed=seed)
+        # ---- compatibility aliases (older simulate.py) ----
+        if "vaccine_age" in kwargs: vacc_age = kwargs.pop("vaccine_age")
+        if "coverage_f" in kwargs: cov_f = kwargs.pop("coverage_f")
+        if "coverage_m" in kwargs: cov_m = kwargs.pop("coverage_m")
+        if "coverageFemale" in kwargs: cov_f = kwargs.pop("coverageFemale")
+        if "coverageMale" in kwargs: cov_m = kwargs.pop("coverageMale")
+        # silently ignore any other kwargs
+
         self.N = N
-        self.vaccine_efficacy = vaccine_efficacy
-        self.coverage_f = coverage_f
-        self.coverage_m = coverage_m
-        self.beta_f = beta_f
-        self.beta_m = beta_m
-        self.hr_fraction = hr_fraction
-        self.gamma_recovery = gamma_recovery
-        self.R_duration_years = R_duration_years
-        self.p_cancer_per_year_HR = p_cancer_per_year_HR
-        self.initial_prev = initial_prev
-        self.powerlaw_gamma = powerlaw_gamma
-        self.mean_degree = mean_degree
-        self.assort_within_activity = assort_within_activity
-        self.burn_in_years = burn_in_years
-
-        self.schedule = RandomActivation(self)
-        self.G = nx.Graph()
-
-        self._init_population()
-        self._build_powerlaw_network()
-        self._assign_activity_by_degree()
-        self._rewire_for_assortativity()
-
-        self.t = 0
-        self.datacollector = DataCollector(
-            model_reporters={
-                "t": lambda m: m.t,
-                "N": lambda m: m.N,
-                "I_HR": lambda m: sum(1 for a in m.schedule.agents if a.state == 'I_HR'),
-                "I_LR": lambda m: sum(1 for a in m.schedule.agents if a.state == 'I_LR'),
-                "R": lambda m: sum(1 for a in m.schedule.agents if a.state == 'R'),
-                "V": lambda m: sum(1 for a in m.schedule.agents if a.vaccinated),
-                "Prev": lambda m: (sum(1 for a in m.schedule.agents if a.state in ('I_HR','I_LR')) / m.N),
-                "CancerCum": lambda m: sum(1 for a in m.schedule.agents if a.cancer_flag),
-            }
+        self.rng = random.Random(seed)
+        self.params = dict(
+            gamma=gamma,
+            assortativity=assortativity,
+            p_transmission_hr=p_transmission_hr,
+            p_transmission_lr=p_transmission_lr,
+            hr_share=hr_share,
+            mean_duration=mean_duration,
+            p_waning=p_waning,
+            p_cancer=p_cancer,
+            cancer_risk_mult_if_vaccinated=cancer_risk_mult_if_vaccinated,
+            vaccine_eff=vaccine_eff,
+            vacc_age=vacc_age,
+            cov_f=cov_f, cov_m=cov_m,
+            contacts_per_year=contacts_per_year,
+            max_age=max_age,
+            annual_birth_fraction=annual_birth_fraction,
+            catchup_years=catchup_years,
+            catchup_age_min=catchup_age_min,
+            catchup_age_max=catchup_age_max,
         )
+        self.agents: List[Agent] = []
+        self.time = 0
+        self.cancer_cum = 0
+        self.intervention_years = 0
+        self._init_population()
+        self._init_network()
 
-    # ---------- Population ----------
-    def _init_population(self):
-        for uid in range(self.N):
-            sex = 'F' if self.random.random() < 0.5 else 'M'
-            age = self.random.randrange(0, 51)  # 0..50
-            agent = HPVAgent(uid, self, sex, age)
 
-            # initial infection: 1% I_HR
-            if self.random.random() < self.initial_prev:
-                agent.state = 'I_HR'
-            self.schedule.add(agent)
-            self.G.add_node(uid)
-
-    # ---------- Network ----------
-    def _build_powerlaw_network(self):
-        """
-        Build a simple undirected network with a power-law-like degree sequence
-        tuned to approximate 'mean_degree'. We use a truncated power-law sampler.
-        """
-        rng = np.random.default_rng(self.random.randint(0, 10**9))
-        # sample degrees from truncated power law (k>=1)
-        # P(k) ~ k^-gamma
-        def sample_degree():
-            # inverse transform sampling over [1, k_max]
-            k_min, k_max = 1, max(5, int(2 * self.mean_degree) * 10)
-            u = rng.uniform()
-            if self.powerlaw_gamma == 1:
-                k = int(np.floor(np.exp(u * np.log(k_max / k_min)) * k_min))
+        # init datacollector and capture baseline (t=0)
+        self.datacollector = _MiniDataCollector(self)
+        self.datacollector.collect()
+    def _init_population(self) -> None:
+        for i in range(self.N):
+            sex = "F" if self.rng.random() < 0.5 else "M"
+            age = self.rng.randint(0, 50)
+            r = self.rng.random()
+            if r < 0.06:
+                state = STATE_I_HR
+            elif r < 0.10:
+                state = STATE_I_LR
             else:
-                g = self.powerlaw_gamma
-                c = (k_max**(1-g) - k_min**(1-g))
-                x = (u * c + k_min**(1-g)) ** (1/(1-g))
-                k = int(np.clip(np.floor(x), k_min, k_max))
-            return k
+                state = STATE_S
+            self.agents.append(Agent(i, sex, age, state))
 
-        deg_seq = [sample_degree() for _ in range(self.N)]
-        # adjust sum to be even
+    def _sample_degree(self, gamma: float) -> int:
+        k_max = 50
+        u = self.rng.random()
+        val = 1.0 / (1.0 - u) ** (1.0 / (gamma - 1.0))
+        return int(min(max(round(val) - 1, 0), k_max))
+
+    def _init_network(self) -> None:
+        gamma = self.params["gamma"]
+        deg_seq = [self._sample_degree(gamma) for _ in range(len(self.agents))]
         if sum(deg_seq) % 2 == 1:
             deg_seq[0] += 1
+        Gm = nx.configuration_model(deg_seq, seed=self.rng.randint(0, 10**9))
+        G = nx.Graph(Gm); G.remove_edges_from(nx.selfloop_edges(G))
+        self._apply_assortativity(G)
+        self.G = G
 
-        # Configuration model, then project to simple graph
-        Gcm = nx.configuration_model(deg_seq, seed=self.random.randint(0, 10**9))
-        Gcm = nx.Graph(Gcm)   # remove parallel edges
-        Gcm.remove_edges_from(nx.selfloop_edges(Gcm))
-        # keep only nodes 0..N-1
-        self.G = nx.Graph()
-        self.G.add_nodes_from(range(self.N))
-        self.G.add_edges_from(Gcm.edges())
+    def _apply_assortativity(self, G: nx.Graph) -> None:
+        p = self.params["assortativity"]
+        if p <= 0.0 or G.number_of_edges() == 0: return
+        degs = sorted(G.degree, key=lambda x: x[1])
+        low = [n for n, _ in degs[: len(degs)//2]]
+        high = [n for n, _ in degs[len(degs)//2:]]
+        edges = list(G.edges()); self.rng.shuffle(edges)
+        for (u, v) in edges[:int(p * len(edges))]:
+            if (u in low and v in high) or (u in high and v in low):
+                group = low if u in low else high
+                cand = self.rng.choice(group)
+                if cand != u and not G.has_edge(u, cand):
+                    G.remove_edge(u, v); G.add_edge(u, cand)
 
-    def _assign_activity_by_degree(self):
-        # Quantile split by degree: low (0-70%), mid (70-95%), high (95-100%)
-        deg = dict(self.G.degree())
-        degrees = np.array([deg[i] for i in range(self.N)])
-        q70, q95 = np.quantile(degrees, [0.7, 0.95])
-        for i, agent in enumerate(self.schedule.agents):
-            d = deg[i]
-            if d <= q70:
-                agent.activity = 'low'
-            elif d <= q95:
-                agent.activity = 'mid'
-            else:
-                agent.activity = 'high'
+    def step(self, vacc_enabled: bool = False) -> None:
+        p = self.params
+        self.time += 1
+        if vacc_enabled:
+            self.intervention_years += 1
 
-    def _rewire_for_assortativity(self):
-        """
-        Increase within-activity edges by simple stub rewiring:
-        with probability 'assort_within_activity' keep edges within the same activity.
-        """
-        edges = list(self.G.edges())
-        self.G.remove_edges_from(edges)
-        nodes_by_act = {
-            'low': [a.unique_id for a in self.schedule.agents if a.activity == 'low'],
-            'mid': [a.unique_id for a in self.schedule.agents if a.activity == 'mid'],
-            'high': [a.unique_id for a in self.schedule.agents if a.activity == 'high'],
-        }
-        # add edges back with assortative preference
-        rng = self.random
-        for u, v in edges:
-            au = self.schedule.agents[u].activity
-            av = self.schedule.agents[v].activity
-            if rng.random() < self.assort_within_activity:
-                # same-activity attempt
-                pool = nodes_by_act[au]
-                if len(pool) > 1:
-                    v2 = rng.choice(pool)
-                    if u != v2 and not self.G.has_edge(u, v2):
-                        self.G.add_edge(u, v2)
-                        continue
-            # fallback: random original
-            if not self.G.has_edge(u, v):
-                self.G.add_edge(u, v)
+        # aging
+        for a in self.agents: a.age += 1
 
-    # ---------- Transmission ----------
-    def _transmission_phase(self):
-        """
-        For each edge, if one infectious and the other susceptible, infect with prob:
-          beta_f if recipient is F, beta_m if recipient is M,
-        scaled by recipient's susceptibility_multiplier (vaccination).
-        New infections go to HR with prob hr_fraction, else LR.
-        """
-        new_infections: List[int] = []
+        # vaccination (routine + catch-up)
+        if vacc_enabled:
+            for a in self.agents:
+                if a.age == p["vacc_age"] and not a.vaccinated:
+                    cov = p["cov_f"] if a.sex == "F" else p["cov_m"]
+                    if self.rng.random() < cov: a.vaccinated = True
+            if self.intervention_years <= p["catchup_years"]:
+                for a in self.agents:
+                    if (not a.vaccinated) and (p["catchup_age_min"] <= a.age <= p["catchup_age_max"]):
+                        cov = p["cov_f"] if a.sex == "F" else p["cov_m"]
+                        if self.rng.random() < cov: a.vaccinated = True
+
+        # safety: ensure some vaccinated in year 1 if coverage>0
+        if vacc_enabled and self.intervention_years == 1 and not any(a.vaccinated for a in self.agents):
+            for a in self.agents:
+                if 12 <= a.age <= 26 and not a.vaccinated:
+                    cov = p["cov_f"] if a.sex == "F" else p["cov_m"]
+                    if self.rng.random() < cov: a.vaccinated = True
+
+        # transmission (by positions)
+        contacts = max(1, int(p["contacts_per_year"]))
+        newly = []
         for u, v in self.G.edges():
-            au: HPVAgent = self.schedule._agents[u]
-            av: HPVAgent = self.schedule._agents[v]
+            au, av = self.agents[u], self.agents[v]
+            def try_inf(s_pos, inf_ag):
+                s = self.agents[s_pos]
+                if s.state != STATE_S or inf_ag.state not in (STATE_I_HR, STATE_I_LR): return
+                eff = p["vaccine_eff"] if s.vaccinated else 0.0
+                base = p["p_transmission_hr"] if inf_ag.state == STATE_I_HR else p["p_transmission_lr"]
+                prob = 1.0 - (1.0 - base * (1.0 - eff)) ** contacts
+                if self.rng.random() < prob:
+                    newly.append((s_pos, STATE_I_HR if self.rng.random() < p["hr_share"] else STATE_I_LR))
+            try_inf(u, av); try_inf(v, au)
+        for pos, st in newly:
+            if self.agents[pos].state == STATE_S:
+                self.agents[pos].state = st
+                self.agents[pos].inf_timer = 0
 
-            # u -> v
-            if au.infectious() and av.state == 'S':
-                beta = self.beta_f if av.sex == 'F' else self.beta_m
-                p = beta * av.susceptibility_multiplier()
-                if self.random.random() < p:
-                    new_infections.append(v)
+        # cancer BEFORE recovery (with protection for vaccinated)
+        for a in self.agents:
+            if (a.sex == "F") and (a.age >= 25) and (a.state == STATE_I_HR):
+                risk = p["p_cancer"]
+                if a.vaccinated:
+                    risk *= p["cancer_risk_mult_if_vaccinated"]
+                if self.rng.random() < risk:
+                    self.cancer_cum += 1
 
-            # v -> u
-            if av.infectious() and au.state == 'S':
-                beta = self.beta_f if au.sex == 'F' else self.beta_m
-                p = beta * au.susceptibility_multiplier()
-                if self.random.random() < p:
-                    new_infections.append(u)
+        # natural history
+        for a in self.agents:
+            if a.state in (STATE_I_HR, STATE_I_LR):
+                a.inf_timer += 1
+                if self.rng.random() < (1.0 / p["mean_duration"]):
+                    a.state = STATE_R; a.inf_timer = 0
+            elif a.state == STATE_R and self.rng.random() < p["p_waning"]:
+                a.state = STATE_S
 
-        for idx in new_infections:
-            ag: HPVAgent = self.schedule._agents[idx]
-            ag.state = 'I_HR' if (self.random.random() < self.hr_fraction) else 'I_LR'
-            ag.infection_years = 0
+        # demography
+        max_age = p["max_age"]
+        births_target = int(self.N * p["annual_birth_fraction"])
+        to_remove = [a for a in self.agents if a.age > max_age]
+        if len(to_remove) < births_target:
+            rest = sorted([a for a in self.agents if a not in to_remove], key=lambda x: x.age, reverse=True)
+            to_remove += rest[: births_target - len(to_remove)]
+        remove_ids = {a.idx for a in to_remove}
+        survivors = [a for a in self.agents if a.idx not in remove_ids]
+        next_idx = (max(a.idx for a in survivors) + 1) if survivors else 0
+        newborns = [Agent(next_idx+i, "F" if self.rng.random()<0.5 else "M", 0, STATE_S)
+                    for i in range(len(to_remove))]
+        self.agents = survivors + newborns
+        self._init_network()
 
-    # ---------- Step / Run ----------
-    def step(self):
-        self._transmission_phase()
-        self.schedule.step()
-        self.datacollector.collect(self)
-        self.t += 1
+        # collect after each step
+        self.datacollector.collect()
 
-    def run(self, years: int):
-        # collect t=0
-        self.datacollector.collect(self)
-        for _ in range(years):
-            self.step()
-        return self.datacollector.get_model_vars_dataframe()
+
+    def metrics(self) -> Dict[str, float]:
+        I_HR = sum(1 for a in self.agents if a.state == STATE_I_HR)
+        I_LR = sum(1 for a in self.agents if a.state == STATE_I_LR)
+        R = sum(1 for a in self.agents if a.state == STATE_R)
+        V = sum(1 for a in self.agents if a.vaccinated)
+        N_now = float(len(self.agents)) if self.agents else 1.0
+        return dict(t=int(self.time), 
+            N=N_now, I_HR=float(I_HR), I_LR=float(I_LR), R=float(R), V=float(V),
+            Prev=(I_HR + I_LR) / N_now, CancerCum=float(self.cancer_cum),
+        )
+
+# Backward-compat alias for older code paths
+HPVNetworkModel = HPVModel
